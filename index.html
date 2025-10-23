@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LifeNote - Bloco de Anotações</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📝 LifeNote</h1>
+            <p class="subtitle">Organize seu cérebro</p>
+        </header>
+        
+        <div class="notes-controls">
+            <button id="newNoteBtn" class="btn btn-primary">+ Nova Anotação</button>
+        </div>
+
+        <div id="notesList" class="notes-list"></div>
+
+        <div id="noteModal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 id="modalTitle">Nova Anotação</h2>
+                    <button class="close-btn" id="closeModal">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <input type="text" id="noteTitle" class="note-input" placeholder="Título da anotação">
+                    <textarea id="noteContent" class="note-textarea" placeholder="Escreva suas ideias aqui..."></textarea>
+                </div>
+                <div class="modal-footer">
+                    <button id="deleteNoteBtn" class="btn btn-danger" style="display: none;">Excluir</button>
+                    <div class="modal-actions">
+                        <button id="cancelBtn" class="btn btn-secondary">Cancelar</button>
+                        <button id="saveNoteBtn" class="btn btn-primary">Salvar</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
