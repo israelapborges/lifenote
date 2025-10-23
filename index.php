@@ -242,11 +242,51 @@ endif;
     .pill.active { border-color:var(--accent); color:var(--text); background:#182030; font-weight: 500; }
     .pill .del-nb { margin-left:5px; color:#fca5a5; font-weight:bold; cursor:pointer; }
 
-    .note-item { border:1px solid var(--border); border-radius:12px; padding:12px; margin-bottom:10px; background:#10171f; cursor:pointer; transition:background .2s, transform .2s; display:grid; grid-template-columns:1fr auto; gap:6px; }
+    .note-item {
+        position: relative;
+        border:1px solid var(--border);
+        border-radius:12px;
+        padding:12px;
+        margin-bottom:10px;
+        background:#10171f;
+        cursor:pointer;
+        transition:background .2s, transform .2s;
+        display:grid;
+        grid-template-columns:1fr auto;
+        gap:6px;
+    }
     .note-item:hover { background:#1a2431; transform:translateX(3px); }
     .note-item .title { font-weight:600; color: var(--text); }
     .note-item .meta { color:var(--muted); font-size:12px; margin-top:4px; }
     .pin { color:var(--warn); font-size:12px; }
+
+    .note-item .delete-note-icon {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        color: var(--danger);
+        cursor: pointer;
+        opacity: 0;
+        transition: opacity .2s ease;
+        font-size: 20px;
+        font-weight: bold;
+        line-height: 1;
+        padding: 2px;
+        z-index: 2;
+        background: var(--panel);
+        border-radius: 50%;
+        width: 24px;
+        height: 24px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .note-item:hover .delete-note-icon {
+        opacity: 1;
+    }
+    .note-item .delete-note-icon:hover {
+        background: #3b1a1a;
+    }
 
     .tag { background:#16202c; border:1px solid var(--border); border-radius:999px; padding:5px 9px; margin:2px; display:inline-block; }
     .tag .x { color:#fca5a5; margin-left:5px; cursor:pointer; }
@@ -287,7 +327,7 @@ endif;
             gap: 10px;
         }
         .card { flex-shrink: 0; }
-        .editor .body { min-height: 500px; /* Garante que o editor tenha espaço */}
+        .editor .body { min-height: 500px; }
     }
 
     /* Estilos Dark para TinyMCE */
@@ -539,10 +579,12 @@ function renderNoteList(){
   const box = el('#noteList'); box.innerHTML = '';
   if(!state.notes.length){ box.innerHTML = '<div style="color:var(--muted); text-align:center; padding: 20px;">Nenhuma nota encontrada.</div>'; return; }
   state.notes.forEach(n => {
-    const div = document.createElement('div'); div.className='note-item';
+    const div = document.createElement('div');
+    div.className='note-item';
     const title = escapeHTML(n.title || '(sem título)');
     const snippet = htmlToSnippet(n.content||'');
     div.innerHTML = `
+      <div class="delete-note-icon" title="Excluir nota">×</div>
       <div>
         <div class="title">${title} ${n.pinned?'<span class="pin">📌</span>':''}</div>
         <div class="meta">${n.updated_at} ${n.archived?' · arquivada':''}</div>
@@ -550,7 +592,13 @@ function renderNoteList(){
       </div>
       <div class="meta" style="text-align:right;">${escapeHTML(n.tags ? n.tags.join(', ') : '')}</div>
     `;
-    div.onclick = ()=> openNote(n.id);
+    div.onclick = () => openNote(n.id);
+
+    const deleteBtn = div.querySelector('.delete-note-icon');
+    deleteBtn.onclick = (e) => {
+        e.stopPropagation();
+        deleteNoteFromList(n.id, n.title);
+    };
     box.appendChild(div);
   });
 }
@@ -634,9 +682,7 @@ async function deleteAttachment(id){
     await refreshAttachments(state.current.id);
 }
 
-// Novo fluxo de upload: Botão dispara input, que dispara upload
 el('#btnChooseAttachment').onclick = () => {
-    // Se o botão não estiver desabilitado, clica no input de arquivo escondido
     if (!el('#btnChooseAttachment').disabled) {
         el('#fileAttachment').click();
     }
@@ -654,10 +700,7 @@ el('#fileAttachment').onchange = async () => {
     try {
         const url = new URL(location.href);
         url.searchParams.set('api', 'uploadFile');
-        const res = await fetch(url, {
-            method: 'POST',
-            body: formData
-        });
+        const res = await fetch(url, { method: 'POST', body: formData });
         const data = await res.json();
         
         if (data.error) throw new Error(data.error);
@@ -668,10 +711,9 @@ el('#fileAttachment').onchange = async () => {
         toast(e.message);
     } finally {
         setStatus('Pronto.');
-        el('#fileAttachment').value = ''; // Limpa o input para permitir o mesmo arquivo de novo
+        el('#fileAttachment').value = '';
     }
 };
-
 
 // Ações
 el('#btnAddNotebook').onclick = async ()=>{
@@ -681,13 +723,30 @@ el('#btnAddNotebook').onclick = async ()=>{
   state.notebooks = await api('listNotebooks'); renderNotebooks(); setStatus('Caderno criado.');
 };
 
-el('#btnNew').onclick = ()=>{ 
-    state.current=null; 
-    el('#title').value=''; el('#notebook').value=''; 
-    if(editorInstance) { editorInstance.setContent(''); }
+function clearEditor() {
+    state.current = null; 
+    el('#title').value = '';
+    el('#notebook').value = '';
+    if (editorInstance) { editorInstance.setContent(''); }
     renderTagBox([]); 
     refreshAttachments(null);
-};
+    setStatus('Pronto.');
+}
+
+el('#btnNew').onclick = clearEditor;
+
+async function deleteNoteFromList(id, title) {
+    const confirmTitle = title || '(sem título)';
+    if (!confirm(`Tem certeza que deseja excluir permanentemente a nota "${confirmTitle}"?`)) return;
+
+    await api('deleteNote', { id });
+    toast('Nota excluída.');
+
+    if (state.current && state.current.id === id) {
+        clearEditor();
+    }
+    await refreshNotes();
+}
 
 el('#btnSave').onclick = saveCurrent;
 async function saveCurrent(){
@@ -725,10 +784,7 @@ el('#btnDelete').onclick = async ()=>{
   
   await api('deleteNote', {id: state.current.id});
   setStatus('Excluída.');
-  state.current=null; el('#title').value=''; el('#notebook').value=''; 
-  if(editorInstance) { editorInstance.setContent(''); }
-  renderTagBox([]);
-  refreshAttachments(null); 
+  clearEditor();
   await refreshNotes();
 };
 
