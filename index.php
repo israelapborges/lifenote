@@ -22,6 +22,13 @@ const DB_DSN  = 'mysql:host=localhost;dbname=notekit;charset=utf8mb4';
 const DB_USER = 'notekit';
 const DB_PASS = 'PL2VYNN0E5Hw4PGsOuTv';
 
+const ATTACH_DIR = __DIR__ . '/data/attachments';
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB
+
+if (!is_dir(ATTACH_DIR)) {
+    @mkdir(ATTACH_DIR, 0775, true);
+}
+
 //------------------------------------------------------------
 // BOOTSTRAP
 //------------------------------------------------------------
@@ -31,6 +38,16 @@ $pdo = new PDO(DB_DSN, DB_USER, DB_PASS, [
 ]);
 
 ensure_schema($pdo);
+
+if (isset($_GET['attachment'])) {
+    try {
+        stream_attachment($pdo, require_int('attachment'));
+    } catch (Throwable $e) {
+        http_response_code(404);
+        echo 'Arquivo não encontrado';
+    }
+    exit;
+}
 
 //-----------------------------
 // Roteamento API JSON (AJAX)
@@ -51,6 +68,8 @@ if (isset($_GET['api'])) {
             case 'createNotebook':  json(create_notebook($pdo, require_str('name'))); break;
             case 'renameNotebook':  json(rename_notebook($pdo, require_int('id'), require_str('name'))); break;
             case 'deleteNotebook':  json(delete_notebook($pdo, require_int('id'))); break;
+            case 'uploadAttachment': json(upload_attachments($pdo)); break;
+            case 'deleteAttachment': json(delete_attachment_api($pdo, read_json())); break;
             default: http_response_code(404); echo json_encode(['error' => 'API desconhecida']);
         }
     } catch (Throwable $e) {
@@ -108,6 +127,12 @@ if (isset($_GET['api'])) {
 
     .row { display:flex; gap:8px; align-items:center; }
     .grow { flex:1; }
+
+    .attachment-list { display:flex; flex-direction:column; gap:6px; }
+    .attachment-item { display:flex; justify-content:space-between; align-items:center; padding:8px 10px; border:1px solid var(--border); border-radius:10px; background:#10171f; font-size:13px; }
+    .attachment-item a { color:var(--accent); text-decoration:none; }
+    .attachment-item .meta { color:var(--muted); font-size:12px; }
+    .muted { color:var(--muted); }
 
     #status { color:var(--muted); font-size:13px; }
 
@@ -174,6 +199,15 @@ if (isset($_GET['api'])) {
                     <button class="btn" id="btnClearTags" title="Limpar tags">Limpar</button>
                 </div>
             </div>
+            <div>
+                <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Anexos</div>
+                <div id="attachmentList" class="attachment-list"></div>
+                <div class="row" style="margin-top:6px">
+                    <button class="btn" id="btnSelectAttachment" type="button">📎 Adicionar anexos</button>
+                    <div id="pendingUploads" class="muted" style="font-size:12px"></div>
+                </div>
+                <input type="file" id="attachmentUpload" multiple style="display:none" />
+            </div>
         </div>
         <div class="footer">
             <button class="btn primary" id="btnSave">💾 Salvar (Ctrl/Cmd+S)</button>
@@ -196,20 +230,28 @@ const apiJSON = (name, body={}) => {
   url.searchParams.set('api', name);
   return fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(r => r.json());
 };
+const apiForm = (name, formData) => {
+  const url = new URL(location.href);
+  url.searchParams.set('api', name);
+  return fetch(url, {method:'POST', body: formData, credentials:'same-origin'}).then(r => r.json());
+};
 
 // Estado
 let state = {
   filter: { q:'', notebook_id:null, tag:null, archived:false, pinned:false },
   notes: [], notebooks: [], tags: [],
   current: null,
+  pendingUploads: [],
 };
 
 // Helpers de DOM
 const el = sel => document.querySelector(sel);
 const els = sel => Array.from(document.querySelectorAll(sel));
+const ATTACH_HINT = 'Até 10 MB por arquivo.';
 function toast(msg){ const t=el('#toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'), 1600); }
 function setStatus(msg){ el('#status').textContent = msg; toast(msg); setTimeout(()=>{el('#status').textContent='Pronto.'}, 1600); }
 function escapeHTML(s){ return (s+"").replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
+el('#pendingUploads').textContent = ATTACH_HINT;
 
 // Carregar tudo
 async function loadAll(){
@@ -289,12 +331,16 @@ function renderNoteList(){
 async function openNote(id){
   const n = await api('getNote', {id});
   state.current = n;
+  state.current.attachments = n.attachments || [];
   el('#title').value = n.title || '';
   el('#content').value = n.content || '';
   el('#btnPin').dataset.pinned = n.pinned ? '1':'0';
   el('#btnArchive').dataset.archived = n.archived ? '1':'0';
   el('#notebook').value = n.notebook_id || '';
   renderTagBox(n.tags ? n.tags.split(',').filter(Boolean) : []);
+  renderAttachmentList(state.current.attachments);
+  el('#pendingUploads').textContent = ATTACH_HINT;
+  return n;
 }
 
 function renderTagBox(tags){
@@ -313,6 +359,55 @@ function getEditorTags(){
     .map(x=>x.textContent.replace('×','').trim()).filter(Boolean);
 }
 
+function attachmentDownloadUrl(id){
+  const url = new URL(location.origin + location.pathname);
+  url.searchParams.set('attachment', id);
+  return url.toString();
+}
+
+function formatBytes(bytes){
+  const units = ['B','KB','MB','GB'];
+  let size = bytes;
+  let idx = 0;
+  while(size >= 1024 && idx < units.length-1){ size /= 1024; idx++; }
+  return `${size.toFixed(size >= 10 || idx === 0 ? 0 : 1)} ${units[idx]}`;
+}
+
+function renderAttachmentList(list){
+  const box = el('#attachmentList');
+  if(!list || !list.length){
+    box.innerHTML = '<div class="muted" style="font-size:12px">Nenhum anexo.</div>';
+    return;
+  }
+  box.innerHTML = '';
+  list.forEach(att => {
+    const row = document.createElement('div');
+    row.className = 'attachment-item';
+    const info = document.createElement('div');
+    const link = document.createElement('a');
+    link.href = attachmentDownloadUrl(att.id);
+    link.textContent = att.name || 'arquivo';
+    link.target = '_blank';
+    link.rel = 'noopener';
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const details = [];
+    if(att.created_at) details.push(att.created_at);
+    if(typeof att.size === 'number') details.push(formatBytes(att.size));
+    meta.textContent = details.join(' · ');
+    info.appendChild(link);
+    info.appendChild(meta);
+    const remove = document.createElement('button');
+    remove.className = 'btn danger';
+    remove.type = 'button';
+    remove.dataset.attachment = att.id;
+    remove.textContent = 'Remover';
+    row.appendChild(info);
+    row.appendChild(remove);
+    box.appendChild(row);
+  });
+}
+
 // Ações
 el('#btnAddNotebook').onclick = async ()=>{
   const name = el('#newNotebook').value.trim(); if(!name) return;
@@ -321,10 +416,22 @@ el('#btnAddNotebook').onclick = async ()=>{
   state.notebooks = await api('listNotebooks'); renderNotebooks(); setStatus('Caderno criado.');
 };
 
-el('#btnNew').onclick = ()=>{ state.current=null; el('#title').value=''; el('#content').value=''; el('#notebook').value=''; renderTagBox([]); };
+el('#btnNew').onclick = ()=>{
+  state.current=null;
+  state.pendingUploads = [];
+  el('#title').value='';
+  el('#content').value='';
+  el('#notebook').value='';
+  el('#btnPin').dataset.pinned='0';
+  el('#btnArchive').dataset.archived='0';
+  renderTagBox([]);
+  renderAttachmentList([]);
+  el('#pendingUploads').textContent = ATTACH_HINT;
+};
 
-el('#btnSave').onclick = saveCurrent;
-async function saveCurrent(){
+el('#btnSave').onclick = ()=>{ saveCurrent().catch(()=>{}); };
+async function saveCurrent(opts={}){
+  const silent = opts.silent || false;
   const payload = {
     id: state.current?.id || null,
     title: el('#title').value.trim(),
@@ -333,17 +440,28 @@ async function saveCurrent(){
     tags: getEditorTags(),
   };
   const res = await apiJSON('saveNote', payload);
-  setStatus('Salvo.');
+  if(res?.error){
+    toast('Erro: ' + res.error);
+    return null;
+  }
+  if(!silent) setStatus('Salvo.'); else el('#status').textContent='Pronto.';
   await refreshNotes();
-  if(res?.id) openNote(res.id);
+  const savedId = res?.id || null;
+  if(savedId) await openNote(savedId);
+  return savedId;
 }
 
 el('#btnDelete').onclick = async ()=>{
-  if(!state.current?.id) return; 
+  if(!state.current?.id) return;
   if(!confirm('Excluir permanentemente esta nota?')) return;
   await api('deleteNote', {id: state.current.id});
   setStatus('Excluída.');
-  state.current=null; el('#title').value=''; el('#content').value=''; el('#notebook').value=''; renderTagBox([]);
+  state.current=null; el('#title').value=''; el('#content').value=''; el('#notebook').value='';
+  el('#btnPin').dataset.pinned='0';
+  el('#btnArchive').dataset.archived='0';
+  renderTagBox([]);
+  renderAttachmentList([]);
+  el('#pendingUploads').textContent = ATTACH_HINT;
   await refreshNotes();
 };
 
@@ -357,13 +475,68 @@ el('#btnArchive').onclick = async ()=>{
 };
 
 el('#btnPin').onclick = async ()=>{
-  if(!state.current?.id) return; 
+  if(!state.current?.id) return;
   const now = el('#btnPin').dataset.pinned === '1' ? false : true;
   await api('pinNote', {id: state.current.id, pinned: now?'1':'0'});
   el('#btnPin').dataset.pinned = now?'1':'0';
   setStatus(now?'Fixada.':'Desfixada.');
   await refreshNotes();
 };
+
+const attachmentInput = el('#attachmentUpload');
+el('#btnSelectAttachment').onclick = ()=> attachmentInput.click();
+attachmentInput.addEventListener('change', handleAttachmentUpload);
+
+async function handleAttachmentUpload(e){
+  const files = Array.from(e.target.files || []);
+  attachmentInput.value = '';
+  if(!files.length) return;
+  state.pendingUploads = files;
+  el('#pendingUploads').textContent = `Enviando ${files.length} arquivo${files.length>1?'s':''}...`;
+  try {
+    let noteId = state.current?.id || null;
+    if(!noteId){
+      noteId = await saveCurrent({silent:true});
+    }
+    noteId = noteId || state.current?.id || null;
+    if(!noteId){
+      toast('Salve a nota antes de anexar arquivos.');
+      return;
+    }
+    const form = new FormData();
+    form.append('note_id', noteId);
+    files.forEach(file => form.append('files[]', file));
+    const res = await apiForm('uploadAttachment', form);
+    if(res?.error){
+      toast('Erro: ' + res.error);
+      return;
+    }
+    if(Array.isArray(res)){
+      state.current.attachments = [...(state.current.attachments || []), ...res];
+      renderAttachmentList(state.current.attachments);
+      setStatus('Anexo(s) enviados.');
+    }
+  } catch(err){
+    console.error(err);
+    toast('Erro ao enviar anexos.');
+  } finally {
+    state.pendingUploads = [];
+    el('#pendingUploads').textContent = ATTACH_HINT;
+  }
+}
+
+el('#attachmentList').addEventListener('click', async (e)=>{
+  const btn = e.target.closest('button[data-attachment]');
+  if(!btn) return;
+  const id = parseInt(btn.dataset.attachment, 10);
+  if(!id || !state.current?.attachments) return;
+  if(!confirm('Remover este anexo?')) return;
+  const res = await apiJSON('deleteAttachment', {id});
+  if(res?.error){ toast('Erro: ' + res.error); return; }
+  state.current.attachments = state.current.attachments.filter(att => att.id !== id);
+  renderAttachmentList(state.current.attachments);
+  setStatus('Anexo removido.');
+});
 
 // Busca e Tags (editor)
 el('#q').addEventListener('keydown', e=>{ if(e.key==='Enter'){ state.filter.q = el('#q').value.trim(); refreshNotes(); }});
@@ -393,6 +566,7 @@ window.addEventListener('keydown', (e)=>{
   if ((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='k') { e.preventDefault(); el('#q').focus(); }
 });
 
+renderAttachmentList([]);
 loadAll();
 </script>
 </body>
@@ -431,6 +605,18 @@ function ensure_schema(PDO $pdo): void {
         PRIMARY KEY(note_id, tag_id),
         FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE,
         FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    $pdo->exec("CREATE TABLE IF NOT EXISTS attachments (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        note_id INT NOT NULL,
+        original_name VARCHAR(255) NOT NULL,
+        stored_name VARCHAR(255) NOT NULL UNIQUE,
+        mime VARCHAR(120) NULL,
+        size BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE,
+        INDEX(note_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
     // Índice FULLTEXT (tenta; ignora se já existir ou se engine não suportar)
@@ -487,6 +673,204 @@ function set_note_tags(PDO $pdo, int $note_id, array $tags): void {
 }
 
 //------------------------------------------------------------
+// ANEXOS
+//------------------------------------------------------------
+function upload_attachments(PDO $pdo): array {
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
+        throw new Exception('Método inválido');
+    }
+    $note_id = isset($_POST['note_id']) ? (int)$_POST['note_id'] : 0;
+    if ($note_id <= 0) {
+        throw new Exception('Nota inválida');
+    }
+    ensure_note_exists($pdo, $note_id);
+    $files = normalize_files_array($_FILES['files'] ?? ($_FILES['file'] ?? []));
+    if (!$files) {
+        throw new Exception('Nenhum arquivo enviado');
+    }
+    $saved = [];
+    foreach ($files as $file) {
+        $saved[] = save_attachment($pdo, $note_id, $file);
+    }
+    return $saved;
+}
+
+function delete_attachment_api(PDO $pdo, array $data): array {
+    $id = isset($data['id']) ? (int)$data['id'] : 0;
+    if ($id <= 0) {
+        throw new Exception('Anexo inválido');
+    }
+    return delete_attachment($pdo, $id);
+}
+
+function normalize_files_array($spec): array {
+    if (!$spec) return [];
+    if (isset($spec['name']) && is_array($spec['name'])) {
+        $files = [];
+        foreach ($spec['name'] as $idx => $name) {
+            $files[] = [
+                'name' => $name,
+                'type' => $spec['type'][$idx] ?? '',
+                'tmp_name' => $spec['tmp_name'][$idx] ?? '',
+                'error' => $spec['error'][$idx] ?? UPLOAD_ERR_NO_FILE,
+                'size' => $spec['size'][$idx] ?? 0,
+            ];
+        }
+        return array_values(array_filter($files, fn($f) => ($f['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_NO_FILE));
+    }
+    if (isset($spec['name'])) {
+        return [
+            [
+                'name' => $spec['name'],
+                'type' => $spec['type'] ?? '',
+                'tmp_name' => $spec['tmp_name'] ?? '',
+                'error' => $spec['error'] ?? UPLOAD_ERR_NO_FILE,
+                'size' => $spec['size'] ?? 0,
+            ]
+        ];
+    }
+    return [];
+}
+
+function ensure_note_exists(PDO $pdo, int $note_id): void {
+    $st = $pdo->prepare('SELECT id FROM notes WHERE id=?');
+    $st->execute([$note_id]);
+    if (!$st->fetchColumn()) {
+        throw new Exception('Nota não encontrada');
+    }
+}
+
+function save_attachment(PDO $pdo, int $note_id, array $file): array {
+    $error = $file['error'] ?? UPLOAD_ERR_NO_FILE;
+    if ($error !== UPLOAD_ERR_OK) {
+        throw new Exception('Falha ao enviar arquivo');
+    }
+    $size = (int)($file['size'] ?? 0);
+    if ($size <= 0) {
+        throw new Exception('Arquivo vazio');
+    }
+    if ($size > MAX_ATTACHMENT_BYTES) {
+        throw new Exception('Arquivo excede o limite de 10 MB');
+    }
+    $original = trim((string)($file['name'] ?? ''));
+    $original = basename($original);
+    $original = $original !== '' ? $original : 'anexo';
+    if (function_exists('mb_substr')) {
+        $original = mb_substr($original, 0, 200);
+    } else {
+        $original = substr($original, 0, 200);
+    }
+
+    $ext = pathinfo($original, PATHINFO_EXTENSION);
+    $safeExtSuffix = '';
+    if ($ext !== '') {
+        $safeExt = preg_replace('/[^A-Za-z0-9]/', '', $ext);
+        if ($safeExt !== '') {
+            $safeExtSuffix = '.' . strtolower($safeExt);
+        }
+    }
+
+    $stored = bin2hex(random_bytes(16)) . $safeExtSuffix;
+    $target = attachment_path($stored);
+    while (file_exists($target)) {
+        $stored = bin2hex(random_bytes(16)) . $safeExtSuffix;
+        $target = attachment_path($stored);
+    }
+
+    $tmp = $file['tmp_name'] ?? '';
+    if (!$tmp || !is_uploaded_file($tmp)) {
+        throw new Exception('Upload inválido');
+    }
+    if (!move_uploaded_file($tmp, $target)) {
+        throw new Exception('Falha ao salvar arquivo');
+    }
+
+    $mime = (string)($file['type'] ?? '');
+    if ($mime === '' && function_exists('mime_content_type')) {
+        $detected = @mime_content_type($target);
+        if ($detected) $mime = $detected;
+    }
+
+    $st = $pdo->prepare('INSERT INTO attachments(note_id, original_name, stored_name, mime, size) VALUES (?,?,?,?,?)');
+    $st->execute([$note_id, $original, $stored, $mime, $size]);
+    $id = (int)$pdo->lastInsertId();
+    $row = fetch_attachment($pdo, $id);
+    if (!$row) {
+        throw new Exception('Erro ao registrar anexo');
+    }
+    return attachment_public($row);
+}
+
+function fetch_attachment(PDO $pdo, int $id): ?array {
+    $st = $pdo->prepare('SELECT id, note_id, original_name, stored_name, mime, size, created_at FROM attachments WHERE id=?');
+    $st->execute([$id]);
+    $row = $st->fetch();
+    return $row ?: null;
+}
+
+function attachment_public(?array $row): array {
+    if (!$row) return [];
+    return [
+        'id' => (int)$row['id'],
+        'note_id' => (int)$row['note_id'],
+        'name' => $row['original_name'],
+        'mime' => $row['mime'],
+        'size' => (int)$row['size'],
+        'created_at' => date('Y-m-d H:i', strtotime($row['created_at'] ?? 'now')),
+    ];
+}
+
+function list_attachments(PDO $pdo, int $note_id): array {
+    $st = $pdo->prepare('SELECT id, note_id, original_name, stored_name, mime, size, created_at FROM attachments WHERE note_id=? ORDER BY created_at DESC');
+    $st->execute([$note_id]);
+    $rows = $st->fetchAll();
+    return array_map('attachment_public', $rows);
+}
+
+function attachment_path(string $stored): string {
+    return ATTACH_DIR . '/' . $stored;
+}
+
+function stream_attachment(PDO $pdo, int $id): void {
+    $att = fetch_attachment($pdo, $id);
+    if (!$att) {
+        throw new Exception('Arquivo não encontrado');
+    }
+    $path = attachment_path($att['stored_name']);
+    if (!is_file($path)) {
+        throw new Exception('Arquivo não encontrado');
+    }
+    $name = $att['original_name'];
+    $mime = $att['mime'] ?: 'application/octet-stream';
+    $cleanName = preg_replace("/[\"\\\\]/", '', $name);
+    $encoded = rawurlencode($name);
+    header('Content-Type: ' . $mime);
+    header('Content-Length: ' . (int)$att['size']);
+    header('Content-Disposition: attachment; filename="' . $cleanName . '"; filename*=UTF-8\'\'' . $encoded);
+    header('X-Content-Type-Options: nosniff');
+    readfile($path);
+}
+
+function delete_attachment(PDO $pdo, int $id): array {
+    $att = fetch_attachment($pdo, $id);
+    if (!$att) {
+        throw new Exception('Anexo não encontrado');
+    }
+    $pdo->prepare('DELETE FROM attachments WHERE id=?')->execute([$id]);
+    $path = attachment_path($att['stored_name']);
+    if (is_file($path)) {
+        @unlink($path);
+    }
+    return ['ok' => 1];
+}
+
+function attachment_files_for_note(PDO $pdo, int $note_id): array {
+    $st = $pdo->prepare('SELECT stored_name FROM attachments WHERE note_id=?');
+    $st->execute([$note_id]);
+    return $st->fetchAll(PDO::FETCH_COLUMN) ?: [];
+}
+
+//------------------------------------------------------------
 // NOTAS
 //------------------------------------------------------------
 function list_notes(PDO $pdo): array {
@@ -540,6 +924,7 @@ function get_note(PDO $pdo, int $id): array {
     $st->execute([$id]); $note = $st->fetch();
     if(!$note) throw new Exception('Nota não encontrada');
     $note['tags'] = tags_for_note($pdo, $id);
+    $note['attachments'] = list_attachments($pdo, $id);
     return $note;
 }
 
@@ -563,10 +948,17 @@ function save_note(PDO $pdo, array $data): array {
 }
 
 function delete_note(PDO $pdo, int $id): array {
+    $files = attachment_files_for_note($pdo, $id);
     $pdo->beginTransaction();
     $pdo->prepare("DELETE FROM note_tags WHERE note_id=?")->execute([$id]);
     $pdo->prepare("DELETE FROM notes WHERE id=?")->execute([$id]);
     $pdo->commit();
+    foreach ($files as $stored) {
+        $path = attachment_path($stored);
+        if (is_file($path)) {
+            @unlink($path);
+        }
+    }
     return ['ok'=>1];
 }
 
